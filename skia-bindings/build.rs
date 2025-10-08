@@ -14,6 +14,80 @@ fn main() -> Result<(), io::Error> {
         return fake_bindings();
     }
 
+    // Check if we should use pkg-config to find skia
+    if env::use_pkg_config() {
+        println!("USING PKG-CONFIG TO FIND SKIA");
+
+        let features = features::Features::from_cargo_env();
+
+        let libs = if features[features::feature::TEXTLAYOUT] {
+            &[
+                "skia",
+                "skparagraph",
+                "skshaper",
+                "skunicode_core",
+                "skunicode_icu",
+            ][..]
+        } else {
+            &["skia"][..]
+        };
+
+        // Probe all libraries and collect defines from all of them
+        let mut all_defines = std::collections::HashMap::new();
+        for lib in libs {
+            let lib_info = pkg_config::Config::new()
+                .probe(lib)
+                .map_err(|e| io::Error::other(format!("pkg-config failed for {}: {}", lib, e)))?;
+
+            // Merge defines from this library
+            for (name, value) in lib_info.defines.iter() {
+                all_defines.insert(name.clone(), value.clone());
+            }
+        }
+
+        // pkg-config already emits the necessary cargo directives via its probe() call,
+        // but we still need to generate bindings
+
+        // Get the skia include directory from pkg-config variable
+        let skia_source_dir = env::source_dir().unwrap_or_else(|| {
+            pkg_config::get_variable("skia", "skia_includedir")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap().join("skia"))
+        });
+
+        let cargo_target = cargo::target();
+
+        // Convert defines to Vec for generate_bindings
+        // These defines come from ALL libraries and will be used for both bindgen and cc
+        let mut definitions: Vec<(String, Option<String>)> = all_defines.into_iter().collect();
+
+        let binaries_config =
+            binaries_config::BinariesConfiguration::from_features(&features, env::is_skia_debug());
+
+        // Generate bindings - the definitions will be passed to both bindgen and cc
+        generate_bindings(
+            &features,
+            definitions,
+            &binaries_config,
+            &skia_source_dir,
+            cargo_target.clone(),
+            None,
+        );
+
+        // Link the compiled bindings library (but not the Skia libraries, those come from pkg-config)
+        cargo::add_link_search(binaries_config.output_directory.to_str().unwrap());
+        cargo::add_static_link_libs(
+            &cargo_target,
+            binaries_config.binding_libraries.iter().map(|s| s.as_str()),
+        );
+        cargo::add_link_libs(&binaries_config.link_libraries);
+
+        return Ok(());
+    } else {
+        println!("NOT USING PKG-CONFIG TO FIND SKIA");
+    }
+
     let skia_debug = env::is_skia_debug();
     let cargo_target = cargo::target();
 
@@ -233,5 +307,10 @@ mod env {
 
     pub fn is_docs_rs_build() -> bool {
         matches!(cargo::env_var("DOCS_RS"), Some(v) if v != "0")
+    }
+
+    /// Whether to use pkg-config to find skia.
+    pub fn use_pkg_config() -> bool {
+        matches!(cargo::env_var("SKIA_USE_PKG_CONFIG"), Some(v) if v == "true" || v == "1")
     }
 }
